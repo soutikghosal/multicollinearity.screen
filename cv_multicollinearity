@@ -1,0 +1,330 @@
+screen_multicollinearity_cv <- function(
+    data,
+    target,                       # character: target variable name
+    cont = NULL,                  # character vector of continuous var names (optional)
+    cat = NULL,                   # character vector of categorical var names (optional)
+    model_type = "auto",          # "regression", "classification", or "auto"
+    cv_folds = 5,                 # number of CV folds
+    cv_repeats = 3,               # number of CV repetitions
+    improvement_threshold = 0.02, # minimum improvement to flag variable as important
+    encoding = "dummy",           # "dummy" or "effect" encoding for categoricals
+    seed = 42                     # reproducibility
+) {
+  stopifnot(is.data.frame(data))
+  stopifnot(target %in% names(data))
+  stopifnot(encoding %in% c("dummy", "effect"))
+  stopifnot(model_type %in% c("auto", "regression", "classification"))
+  
+  set.seed(seed)
+  
+  # --- helpers ---
+  is_categorical <- function(x) is.factor(x) || is.character(x) || is.logical(x)
+  is_continuous <- function(x) is.numeric(x) && !is.integer(as.factor(x))
+  
+  # Determine model type if auto
+  if (model_type == "auto") {
+    target_var <- data[[target]]
+    if (is_categorical(target_var) || length(unique(target_var[!is.na(target_var)])) <= 10) {
+      model_type <- "classification"
+    } else {
+      model_type <- "regression"
+    }
+  }
+  
+  # Performance metrics
+  calc_performance <- function(actual, predicted, type) {
+    if (type == "regression") {
+      # R-squared (coefficient of determination)
+      ss_res <- sum((actual - predicted)^2, na.rm = TRUE)
+      ss_tot <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+      r_squared <- 1 - (ss_res / ss_tot)
+      return(r_squared)
+    } else {
+      # Classification accuracy
+      if (is.numeric(predicted)) {
+        # If probabilities, convert to classes
+        if (all(predicted >= 0 & predicted <= 1, na.rm = TRUE)) {
+          predicted <- ifelse(predicted > 0.5, levels(as.factor(actual))[2], levels(as.factor(actual))[1])
+        }
+      }
+      accuracy <- mean(actual == predicted, na.rm = TRUE)
+      return(accuracy)
+    }
+  }
+  
+  # Cross-validation with variable removal
+  cv_with_removal <- function(X, y, remove_vars = character(), type) {
+    if (length(remove_vars) > 0) {
+      # Remove specified variables (and related encoded variables)
+      remove_patterns <- paste0("^", remove_vars, "($|_)")
+      remove_pattern <- paste(remove_patterns, collapse = "|")
+      keep_cols <- !grepl(remove_pattern, colnames(X))
+      X_subset <- X[, keep_cols, drop = FALSE]
+    } else {
+      X_subset <- X
+    }
+    
+    if (ncol(X_subset) == 0) return(NA)
+    
+    # Combine data
+    cv_data <- cbind(target = y, X_subset)
+    complete_rows <- complete.cases(cv_data)
+    cv_data <- cv_data[complete_rows, , drop = FALSE]
+    
+    if (nrow(cv_data) < cv_folds) return(NA)
+    
+    # Cross-validation
+    n <- nrow(cv_data)
+    fold_size <- floor(n / cv_folds)
+    performances <- numeric()
+    
+    for (rep in seq_len(cv_repeats)) {
+      # Shuffle data
+      shuffled_idx <- sample(seq_len(n))
+      cv_data_shuffled <- cv_data[shuffled_idx, , drop = FALSE]
+      
+      for (fold in seq_len(cv_folds)) {
+        # Create fold indices
+        start_idx <- (fold - 1) * fold_size + 1
+        if (fold == cv_folds) {
+          end_idx <- n  # Last fold gets remainder
+        } else {
+          end_idx <- fold * fold_size
+        }
+        
+        test_idx <- start_idx:end_idx
+        train_idx <- setdiff(seq_len(n), test_idx)
+        
+        train_data <- cv_data_shuffled[train_idx, , drop = FALSE]
+        test_data <- cv_data_shuffled[test_idx, , drop = FALSE]
+        
+        # Fit model
+        tryCatch({
+          if (type == "regression") {
+            if (ncol(X_subset) > 0) {
+              model <- lm(target ~ ., data = train_data)
+              pred <- predict(model, newdata = test_data)
+            } else {
+              # Intercept-only model
+              pred <- rep(mean(train_data$target), nrow(test_data))
+            }
+          } else {
+            if (ncol(X_subset) > 0) {
+              model <- glm(target ~ ., data = train_data, family = binomial())
+              pred <- predict(model, newdata = test_data, type = "response")
+            } else {
+              # Intercept-only model
+              most_common <- names(sort(table(train_data$target), decreasing = TRUE))[1]
+              pred <- rep(most_common, nrow(test_data))
+            }
+          }
+          
+          perf <- calc_performance(test_data$target, pred, type)
+          performances <- c(performances, perf)
+        }, error = function(e) {
+          # Model fitting failed, skip this fold
+        })
+      }
+    }
+    
+    if (length(performances) == 0) return(NA)
+    mean(performances, na.rm = TRUE)
+  }
+  
+  # Encoding functions (same as previous functions)
+  encode_dummy <- function(x, var_name) {
+    x_factor <- as.factor(x)
+    levels_x <- levels(droplevels(x_factor))
+    
+    if (length(levels_x) < 2) return(NULL)
+    if (length(levels_x) == 2) {
+      dummy_mat <- matrix(as.numeric(x_factor == levels_x[2]), ncol = 1)
+      colnames(dummy_mat) <- paste0(var_name, "_", levels_x[2])
+    } else {
+      dummy_mat <- model.matrix(~ . - 1, data = data.frame(x = x_factor))[, -1, drop = FALSE]
+      colnames(dummy_mat) <- paste0(var_name, "_", levels_x[-1])
+    }
+    dummy_mat
+  }
+  
+  encode_effect <- function(x, var_name) {
+    x_factor <- as.factor(x)
+    levels_x <- levels(droplevels(x_factor))
+    
+    if (length(levels_x) < 2) return(NULL)
+    if (length(levels_x) == 2) {
+      effect_mat <- matrix(ifelse(x_factor == levels_x[1], -1, 1), ncol = 1)
+      colnames(effect_mat) <- paste0(var_name, "_effect")
+    } else {
+      contrasts(x_factor) <- contr.sum(length(levels_x))
+      effect_mat <- model.matrix(~ x_factor)[, -1, drop = FALSE]
+      colnames(effect_mat) <- paste0(var_name, "_effect", seq_len(ncol(effect_mat)))
+    }
+    effect_mat
+  }
+  
+  # --- infer variable sets ---
+  all_vars <- setdiff(names(data), target)
+  
+  if (is.null(cont) || is.null(cat)) {
+    cont_auto <- intersect(names(Filter(is.numeric, data)), all_vars)
+    cat_auto <- intersect(names(Filter(is_categorical, data)), all_vars)
+    if (is.null(cont)) cont <- cont_auto
+    if (is.null(cat)) cat <- cat_auto
+  }
+  
+  cont <- intersect(cont, all_vars)
+  cat <- intersect(cat, all_vars)
+  
+  # Drop constant/single-level variables
+  if (length(cont)) {
+    const_cont <- cont[vapply(cont, function(v) {
+      x <- data[[v]]; x <- x[!is.na(x)]
+      length(unique(x)) < 2
+    }, logical(1))]
+    cont <- setdiff(cont, const_cont)
+  }
+  
+  if (length(cat)) {
+    single_cat <- cat[vapply(cat, function(v) {
+      x <- as.factor(data[[v]]); x <- x[!is.na(x)]
+      length(levels(droplevels(x))) < 2
+    }, logical(1))]
+    cat <- setdiff(cat, single_cat)
+  }
+  
+  if (length(cont) + length(cat) < 1) {
+    stop("Need at least 1 predictor variable for CV analysis")
+  }
+  
+  # --- encode predictor data ---
+  encoded_data <- list()
+  var_mapping <- list()
+  
+  if (length(cont) > 0) {
+    for (v in cont) {
+      encoded_data[[v]] <- data[[v]]
+      var_mapping[[v]] <- v
+    }
+  }
+  
+  if (length(cat) > 0) {
+    for (v in cat) {
+      if (encoding == "dummy") {
+        encoded_mat <- encode_dummy(data[[v]], v)
+      } else {
+        encoded_mat <- encode_effect(data[[v]], v)
+      }
+      
+      if (!is.null(encoded_mat)) {
+        for (j in seq_len(ncol(encoded_mat))) {
+          col_name <- colnames(encoded_mat)[j]
+          encoded_data[[col_name]] <- encoded_mat[, j]
+          var_mapping[[col_name]] <- v
+        }
+      }
+    }
+  }
+  
+  # Convert to matrix/data frame
+  X <- do.call(data.frame, encoded_data)
+  y <- data[[target]]
+  
+  # --- baseline performance (all variables) ---
+  baseline_perf <- cv_with_removal(X, y, remove_vars = character(), model_type)
+  
+  if (is.na(baseline_perf)) {
+    stop("Could not compute baseline performance - check data quality and target variable")
+  }
+  
+  # --- test removal of each original variable ---
+  original_vars <- unique(c(cont, cat))
+  removal_results <- list()
+  
+  for (var in original_vars) {
+    perf_without <- cv_with_removal(X, y, remove_vars = var, model_type)
+    
+    if (!is.na(perf_without)) {
+      performance_drop = baseline_perf - perf_without
+      removal_results[[var]] <- list(
+        variable = var,
+        baseline_performance = baseline_perf,
+        performance_without = perf_without,
+        performance_drop = performance_drop,
+        relative_importance = performance_drop / baseline_perf
+      )
+    }
+  }
+  
+  # Convert to data frame
+  if (length(removal_results) > 0) {
+    results_df <- data.frame(
+      variable = sapply(removal_results, function(x) x$variable),
+      baseline_perf = sapply(removal_results, function(x) x$baseline_performance),
+      perf_without = sapply(removal_results, function(x) x$performance_without),
+      perf_drop = sapply(removal_results, function(x) x$performance_drop),
+      rel_importance = sapply(removal_results, function(x) x$relative_importance),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    results_df <- data.frame(
+      variable = character(), baseline_perf = numeric(), perf_without = numeric(),
+      perf_drop = numeric(), rel_importance = numeric(), stringsAsFactors = FALSE
+    )
+  }
+  
+  # --- flag variables with low importance (potential multicollinearity) ---
+  # Variables with performance drop < threshold when removed suggest redundancy
+  if (nrow(results_df) > 0) {
+    flagged_subset <- subset(results_df, perf_drop < improvement_threshold)
+    
+    if (nrow(flagged_subset) > 0) {
+      # Sort by performance drop (ascending - least important first)
+      flagged_subset <- flagged_subset[order(flagged_subset$perf_drop), ]
+      rownames(flagged_subset) <- NULL
+      
+      flagged_df <- data.frame(
+        Var1 = flagged_subset$variable,
+        Var2 = "CV_removal",
+        stat = flagged_subset$perf_drop,
+        type = "CV_low_importance",
+        baseline_perf = flagged_subset$baseline_perf,
+        perf_without = flagged_subset$perf_without,
+        rel_importance = flagged_subset$rel_importance,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      flagged_df <- data.frame(
+        Var1 = character(), Var2 = character(), stat = numeric(),
+        type = character(), baseline_perf = numeric(), perf_without = numeric(),
+        rel_importance = numeric(), stringsAsFactors = FALSE
+      )
+    }
+  } else {
+    flagged_df <- data.frame(
+      Var1 = character(), Var2 = character(), stat = numeric(),
+      type = character(), baseline_perf = numeric(), perf_without = numeric(),
+      rel_importance = numeric(), stringsAsFactors = FALSE
+    )
+  }
+  
+  # --- output ---
+  out <- list(
+    inputs = list(
+      cont = cont, cat = cat, target = target, model_type = model_type,
+      cv_folds = cv_folds, cv_repeats = cv_repeats, 
+      improvement_threshold = improvement_threshold, encoding = encoding, seed = seed
+    ),
+    baseline_performance = baseline_perf,
+    variable_importance = results_df,
+    encoded_data = X,
+    var_mapping = var_mapping,
+    flagged = flagged_df,
+    target_type = model_type,
+    n_complete = sum(complete.cases(cbind(y, X))),
+    n_total = nrow(data)
+  )
+  
+  class(out) <- c("mlc_screen_cv", class(out))
+  out
+}
