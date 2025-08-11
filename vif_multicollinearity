@@ -1,0 +1,218 @@
+screen_multicollinearity_vif <- function(
+    data,
+    cont = NULL,                   # character vector of continuous var names (optional)
+    cat = NULL,                    # character vector of categorical var names (optional)  
+    cutoff_vif = 4,               # flag VIF >= cutoff_vif (4 = investigate, 10 = serious)
+    encoding = "dummy",           # "dummy" or "effect" encoding for categoricals
+    use = "pairwise.complete.obs" # NA handling
+) {
+  stopifnot(is.data.frame(data))
+  stopifnot(encoding %in% c("dummy", "effect"))
+  
+  # --- helpers ---
+  is_categorical <- function(x) is.factor(x) || is.character(x) || is.logical(x)
+  is_continuous <- function(x) is.numeric(x) && !is.integer(as.factor(x))
+  
+  # VIF calculation
+  calculate_vif <- function(X) {
+    if (ncol(X) < 2) return(data.frame(variable = character(), vif = numeric()))
+    
+    vif_values <- numeric(ncol(X))
+    names(vif_values) <- colnames(X)
+    
+    for (i in seq_len(ncol(X))) {
+      # Regress variable i on all others
+      y <- X[, i]
+      X_others <- X[, -i, drop = FALSE]
+      
+      # Handle perfect collinearity
+      tryCatch({
+        fit <- lm(y ~ ., data = X_others, na.action = na.exclude)
+        r_squared <- summary(fit)$r.squared
+        
+        # Handle perfect fit (R² = 1)
+        if (is.na(r_squared) || r_squared >= 0.999) {
+          vif_values[i] <- Inf
+        } else {
+          vif_values[i] <- 1 / (1 - r_squared)
+        }
+      }, error = function(e) {
+        vif_values[i] <<- Inf
+      })
+    }
+    
+    data.frame(
+      variable = names(vif_values),
+      vif = vif_values,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  # Dummy encoding
+  encode_dummy <- function(x, var_name) {
+    x_factor <- as.factor(x)
+    levels_x <- levels(droplevels(x_factor))
+    
+    if (length(levels_x) < 2) return(NULL)
+    if (length(levels_x) == 2) {
+      # Binary: create single dummy (0/1)
+      dummy_mat <- matrix(as.numeric(x_factor == levels_x[2]), ncol = 1)
+      colnames(dummy_mat) <- paste0(var_name, "_", levels_x[2])
+    } else {
+      # Multi-level: create k-1 dummies (drop first level)
+      dummy_mat <- model.matrix(~ . - 1, data = data.frame(x = x_factor))[, -1, drop = FALSE]
+      colnames(dummy_mat) <- paste0(var_name, "_", levels_x[-1])
+    }
+    dummy_mat
+  }
+  
+  # Effect encoding (sum contrasts)
+  encode_effect <- function(x, var_name) {
+    x_factor <- as.factor(x)
+    levels_x <- levels(droplevels(x_factor))
+    
+    if (length(levels_x) < 2) return(NULL)
+    if (length(levels_x) == 2) {
+      # Binary: -1/+1 encoding
+      effect_mat <- matrix(ifelse(x_factor == levels_x[1], -1, 1), ncol = 1)
+      colnames(effect_mat) <- paste0(var_name, "_effect")
+    } else {
+      # Multi-level: sum contrasts (last level = negative sum of others)
+      contrasts(x_factor) <- contr.sum(length(levels_x))
+      effect_mat <- model.matrix(~ x_factor)[, -1, drop = FALSE]
+      colnames(effect_mat) <- paste0(var_name, "_effect", seq_len(ncol(effect_mat)))
+    }
+    effect_mat
+  }
+  
+  # --- infer variable sets if not provided ---
+  if (is.null(cont) || is.null(cat)) {
+    cont_auto <- names(Filter(is.numeric, data))
+    cat_auto <- names(Filter(is_categorical, data))
+    if (is.null(cont)) cont <- cont_auto
+    if (is.null(cat)) cat <- cat_auto
+  }
+  
+  # Keep only existing variables
+  cont <- intersect(cont, names(data))
+  cat <- intersect(cat, names(data))
+  
+  # Drop constant variables from cont
+  if (length(cont)) {
+    const_cont <- cont[vapply(cont, function(v) {
+      x <- data[[v]]; x <- x[!is.na(x)]
+      length(unique(x)) < 2
+    }, logical(1))]
+    cont <- setdiff(cont, const_cont)
+    if (length(const_cont) > 0) {
+      message("Dropped constant numeric variables: ", paste(const_cont, collapse = ", "))
+    }
+  }
+  
+  # Drop single-level factors from cat
+  if (length(cat)) {
+    single_cat <- cat[vapply(cat, function(v) {
+      x <- as.factor(data[[v]]); x <- x[!is.na(x)]
+      length(levels(droplevels(x))) < 2
+    }, logical(1))]
+    cat <- setdiff(cat, single_cat)
+    if (length(single_cat) > 0) {
+      message("Dropped single-level categorical variables: ", paste(single_cat, collapse = ", "))
+    }
+  }
+  
+  if (length(cont) + length(cat) < 2) {
+    stop("Need at least 2 variables for VIF calculation")
+  }
+  
+  # --- encode and combine data ---
+  encoded_data <- list()
+  var_mapping <- list()  # Track which encoded vars came from which original vars
+  
+  # Add continuous variables
+  if (length(cont) > 0) {
+    for (v in cont) {
+      encoded_data[[v]] <- data[[v]]
+      var_mapping[[v]] <- v
+    }
+  }
+  
+  # Encode categorical variables
+  if (length(cat) > 0) {
+    for (v in cat) {
+      if (encoding == "dummy") {
+        encoded_mat <- encode_dummy(data[[v]], v)
+      } else {
+        encoded_mat <- encode_effect(data[[v]], v)
+      }
+      
+      if (!is.null(encoded_mat)) {
+        for (j in seq_len(ncol(encoded_mat))) {
+          col_name <- colnames(encoded_mat)[j]
+          encoded_data[[col_name]] <- encoded_mat[, j]
+          var_mapping[[col_name]] <- v  # Track original variable
+        }
+      }
+    }
+  }
+  
+  # Convert to data frame
+  X <- do.call(data.frame, encoded_data)
+  
+  # Remove rows with any NA (VIF requires complete cases)
+  complete_rows <- complete.cases(X)
+  X_complete <- X[complete_rows, , drop = FALSE]
+  
+  if (nrow(X_complete) < ncol(X_complete) + 1) {
+    stop("Insufficient complete observations for VIF calculation")
+  }
+  
+  # --- calculate VIF ---
+  vif_results <- calculate_vif(X_complete)
+  
+  # Add original variable mapping
+  vif_results$original_var <- vapply(vif_results$variable, function(v) {
+    var_mapping[[v]] %||% v
+  }, character(1))
+  
+  # --- flag high VIF ---
+  flagged_subset <- subset(vif_results, vif >= cutoff_vif)
+  
+  # Create flagged_df in consistent format
+  if (nrow(flagged_subset) > 0) {
+    # Sort by VIF value
+    flagged_subset <- flagged_subset[order(-flagged_subset$vif), ]
+    rownames(flagged_subset) <- NULL
+    
+    flagged_df <- data.frame(
+      Var1 = flagged_subset$variable,
+      Var2 = "",  # VIF is univariate
+      stat = flagged_subset$vif,
+      type = "VIF",
+      original_var = flagged_subset$original_var,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    flagged_df <- data.frame(
+      Var1 = character(), Var2 = character(), stat = numeric(),
+      type = character(), original_var = character(), stringsAsFactors = FALSE
+    )
+  }
+  
+  # --- output ---
+  out <- list(
+    inputs = list(
+      cont = cont, cat = cat, cutoff_vif = cutoff_vif,
+      encoding = encoding, use = use
+    ),
+    vif_results = vif_results,
+    encoded_data = X_complete,
+    var_mapping = var_mapping,
+    flagged = flagged_df,
+    n_complete = nrow(X_complete),
+    n_total = nrow(data)
+  )
+  
+  class(out) <- c("mlc_screen_vif", class(out))
+  out
+}
