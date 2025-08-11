@@ -1,0 +1,264 @@
+screen_multicollinearity_condition <- function(
+    data,
+    cont = NULL,                   # character vector of continuous var names (optional)
+    cat = NULL,                    # character vector of categorical var names (optional)
+    cutoff_condition = 15,         # flag condition index >= cutoff (15 = moderate, 30 = strong)
+    cutoff_variance = 0.5,         # proportion of variance for flagging variable involvement
+    encoding = "dummy",            # "dummy" or "effect" encoding for categoricals
+    scale_vars = TRUE              # scale variables before analysis
+) {
+  stopifnot(is.data.frame(data))
+  stopifnot(encoding %in% c("dummy", "effect"))
+  
+  # --- helpers ---
+  is_categorical <- function(x) is.factor(x) || is.character(x) || is.logical(x)
+  is_continuous <- function(x) is.numeric(x) && !is.integer(as.factor(x))
+  
+  # Condition index and variance decomposition
+  condition_diagnostics <- function(X, scale = TRUE) {
+    if (scale) {
+      X_scaled <- scale(X, center = TRUE, scale = TRUE)
+      # Handle constant columns after scaling
+      const_cols <- apply(X_scaled, 2, function(x) all(is.na(x)) || sd(x, na.rm = TRUE) == 0)
+      if (any(const_cols)) {
+        X_scaled <- X_scaled[, !const_cols, drop = FALSE]
+      }
+    } else {
+      X_scaled <- as.matrix(X)
+    }
+    
+    if (ncol(X_scaled) < 2) {
+      return(list(
+        condition_indices = numeric(),
+        variance_proportions = matrix(nrow = 0, ncol = 0),
+        eigenvalues = numeric(),
+        flagged_dimensions = integer()
+      ))
+    }
+    
+    # SVD decomposition of design matrix
+    tryCatch({
+      svd_result <- svd(X_scaled)
+      eigenvalues <- svd_result$d^2
+      
+      # Condition indices
+      max_eigenval <- max(eigenvalues)
+      condition_indices <- sqrt(max_eigenval / eigenvalues)
+      
+      # Variance-decomposition proportions
+      V <- svd_result$v
+      variance_props <- V^2
+      
+      # Normalize so each row (variable) sums to 1
+      row_sums <- rowSums(variance_props)
+      variance_props <- sweep(variance_props, 1, row_sums, "/")
+      
+      rownames(variance_props) <- colnames(X_scaled)
+      colnames(variance_props) <- paste0("Dim", seq_along(condition_indices))
+      
+      list(
+        condition_indices = condition_indices,
+        variance_proportions = variance_props,
+        eigenvalues = eigenvalues,
+        scaled_matrix = X_scaled
+      )
+    }, error = function(e) {
+      list(
+        condition_indices = numeric(),
+        variance_proportions = matrix(nrow = 0, ncol = 0),
+        eigenvalues = numeric(),
+        error = e$message
+      )
+    })
+  }
+  
+  # Dummy encoding (same as VIF function)
+  encode_dummy <- function(x, var_name) {
+    x_factor <- as.factor(x)
+    levels_x <- levels(droplevels(x_factor))
+    
+    if (length(levels_x) < 2) return(NULL)
+    if (length(levels_x) == 2) {
+      dummy_mat <- matrix(as.numeric(x_factor == levels_x[2]), ncol = 1)
+      colnames(dummy_mat) <- paste0(var_name, "_", levels_x[2])
+    } else {
+      dummy_mat <- model.matrix(~ . - 1, data = data.frame(x = x_factor))[, -1, drop = FALSE]
+      colnames(dummy_mat) <- paste0(var_name, "_", levels_x[-1])
+    }
+    dummy_mat
+  }
+  
+  # Effect encoding (same as VIF function)
+  encode_effect <- function(x, var_name) {
+    x_factor <- as.factor(x)
+    levels_x <- levels(droplevels(x_factor))
+    
+    if (length(levels_x) < 2) return(NULL)
+    if (length(levels_x) == 2) {
+      effect_mat <- matrix(ifelse(x_factor == levels_x[1], -1, 1), ncol = 1)
+      colnames(effect_mat) <- paste0(var_name, "_effect")
+    } else {
+      contrasts(x_factor) <- contr.sum(length(levels_x))
+      effect_mat <- model.matrix(~ x_factor)[, -1, drop = FALSE]
+      colnames(effect_mat) <- paste0(var_name, "_effect", seq_len(ncol(effect_mat)))
+    }
+    effect_mat
+  }
+  
+  # --- infer variable sets if not provided ---
+  if (is.null(cont) || is.null(cat)) {
+    cont_auto <- names(Filter(is.numeric, data))
+    cat_auto <- names(Filter(is_categorical, data))
+    if (is.null(cont)) cont <- cont_auto
+    if (is.null(cat)) cat <- cat_auto
+  }
+  
+  # Keep only existing variables
+  cont <- intersect(cont, names(data))
+  cat <- intersect(cat, names(data))
+  
+  # Drop constant/single-level variables
+  if (length(cont)) {
+    const_cont <- cont[vapply(cont, function(v) {
+      x <- data[[v]]; x <- x[!is.na(x)]
+      length(unique(x)) < 2
+    }, logical(1))]
+    cont <- setdiff(cont, const_cont)
+  }
+  
+  if (length(cat)) {
+    single_cat <- cat[vapply(cat, function(v) {
+      x <- as.factor(data[[v]]); x <- x[!is.na(x)]
+      length(levels(droplevels(x))) < 2
+    }, logical(1))]
+    cat <- setdiff(cat, single_cat)
+  }
+  
+  if (length(cont) + length(cat) < 2) {
+    stop("Need at least 2 variables for condition index calculation")
+  }
+  
+  # --- encode and combine data ---
+  encoded_data <- list()
+  var_mapping <- list()
+  
+  # Add continuous variables
+  if (length(cont) > 0) {
+    for (v in cont) {
+      encoded_data[[v]] <- data[[v]]
+      var_mapping[[v]] <- v
+    }
+  }
+  
+  # Encode categorical variables
+  if (length(cat) > 0) {
+    for (v in cat) {
+      if (encoding == "dummy") {
+        encoded_mat <- encode_dummy(data[[v]], v)
+      } else {
+        encoded_mat <- encode_effect(data[[v]], v)
+      }
+      
+      if (!is.null(encoded_mat)) {
+        for (j in seq_len(ncol(encoded_mat))) {
+          col_name <- colnames(encoded_mat)[j]
+          encoded_data[[col_name]] <- encoded_mat[, j]
+          var_mapping[[col_name]] <- v
+        }
+      }
+    }
+  }
+  
+  # Convert to data frame and get complete cases
+  X <- do.call(data.frame, encoded_data)
+  complete_rows <- complete.cases(X)
+  X_complete <- X[complete_rows, , drop = FALSE]
+  
+  if (nrow(X_complete) < ncol(X_complete) + 1) {
+    stop("Insufficient complete observations for condition index calculation")
+  }
+  
+  # --- calculate condition diagnostics ---
+  diagnostics <- condition_diagnostics(X_complete, scale = scale_vars)
+  
+  if (length(diagnostics$condition_indices) == 0) {
+    warning("Could not calculate condition indices")
+    flagged_df <- data.frame(
+      Var1 = character(), Var2 = character(), stat = numeric(),
+      type = character(), stringsAsFactors = FALSE
+    )
+  } else {
+    # Find problematic dimensions (high condition index)
+    high_cond_dims <- which(diagnostics$condition_indices >= cutoff_condition)
+    
+    # For each problematic dimension, find variables with high variance proportions
+    flagged_vars <- character()
+    flagged_info <- list()
+    
+    for (dim_idx in high_cond_dims) {
+      dim_name <- paste0("Dim", dim_idx)
+      cond_idx <- diagnostics$condition_indices[dim_idx]
+      
+      # Find variables with high variance proportion in this dimension
+      var_props <- diagnostics$variance_proportions[, dim_idx]
+      high_var_vars <- names(var_props)[var_props >= cutoff_variance]
+      
+      if (length(high_var_vars) > 0) {
+        for (var in high_var_vars) {
+          flagged_info[[length(flagged_info) + 1]] <- list(
+            variable = var,
+            dimension = dim_idx,
+            condition_index = cond_idx,
+            variance_prop = var_props[var],
+            original_var = var_mapping[[var]] %||% var
+          )
+        }
+      }
+    }
+    
+    # Convert to data frame
+    if (length(flagged_info) > 0) {
+      flagged_df <- data.frame(
+        Var1 = sapply(flagged_info, function(x) x$variable),
+        Var2 = sapply(flagged_info, function(x) paste0("Dim", x$dimension)),
+        stat = sapply(flagged_info, function(x) x$condition_index),
+        type = "ConditionIndex",
+        variance_prop = sapply(flagged_info, function(x) x$variance_prop),
+        original_var = sapply(flagged_info, function(x) x$original_var),
+        stringsAsFactors = FALSE
+      )
+      flagged_df <- flagged_df[order(-flagged_df$stat), ]
+      rownames(flagged_df) <- NULL
+    } else {
+      flagged_df <- data.frame(
+        Var1 = character(), Var2 = character(), stat = numeric(),
+        type = character(), variance_prop = numeric(), original_var = character(),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  
+  # --- output ---
+  out <- list(
+    inputs = list(
+      cont = cont, cat = cat, cutoff_condition = cutoff_condition,
+      cutoff_variance = cutoff_variance, encoding = encoding, scale_vars = scale_vars
+    ),
+    condition_indices = if(length(diagnostics$condition_indices) > 0) {
+      data.frame(
+        dimension = seq_along(diagnostics$condition_indices),
+        condition_index = diagnostics$condition_indices,
+        eigenvalue = diagnostics$eigenvalues
+      )
+    } else NULL,
+    variance_proportions = diagnostics$variance_proportions,
+    encoded_data = X_complete,
+    var_mapping = var_mapping,
+    flagged = flagged_df,
+    n_complete = nrow(X_complete),
+    n_total = nrow(data)
+  )
+  
+  class(out) <- c("mlc_screen_condition", class(out))
+  out
+}
