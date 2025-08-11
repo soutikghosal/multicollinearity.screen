@@ -1,0 +1,174 @@
+screen_multicollinearity <- function(
+    data,
+    cont = NULL,                   # character vector of continuous var names (optional)
+    cat  = NULL,                   # character vector of categorical var names (optional)
+    method_num = c("pearson","spearman"),
+    cutoff_num = 0.80,             # flag numeric-numeric |correlation| >= cutoff_num
+    cutoff_cat = 0.50,             # flag categorical-categorical V >= cutoff_cat
+    cutoff_mixed = 0.20,           # flag categorical-numeric eta^2 >= cutoff_mixed
+    use = "pairwise.complete.obs"  # NA handling for cor()
+) {
+  stopifnot(is.data.frame(data))
+  method_num <- match.arg(method_num)
+  
+  # --- helpers ---
+  is_categorical <- function(x) is.factor(x) || is.character(x) || is.logical(x)
+  is_continuous  <- function(x) is.numeric(x) && !is.integer(as.factor(x))
+  
+  # Cramer's V via chisq.test
+  cramers_v <- function(x, y) {
+    x <- as.factor(x); y <- as.factor(y)
+    tbl <- table(x, y, useNA = "no")
+    if (any(dim(tbl) < 2L)) return(NA_real_)
+    # suppress warnings for small counts; if error, return NA
+    stat <- tryCatch(suppressWarnings(chisq.test(tbl, correct = FALSE)$statistic),
+                     error = function(e) NA_real_)
+    if (is.na(stat)) return(NA_real_)
+    n <- sum(tbl)
+    phi2 <- as.numeric(stat) / n
+    k <- nrow(tbl); r <- ncol(tbl)
+    denom <- min(k - 1, r - 1)
+    if (denom <= 0) return(NA_real_)
+    v <- sqrt(phi2 / denom)
+    as.numeric(v)
+  }
+  
+  # correlation ratio (eta^2): proportion of variance explained by groups
+  eta_sq <- function(y_cont, x_cat) {
+    if (!is.numeric(y_cont)) return(NA_real_)
+    x <- as.factor(x_cat)
+    ok <- !is.na(y_cont) & !is.na(x)
+    y <- y_cont[ok]; g <- x[ok]
+    if (length(unique(g)) < 2L || length(y) < 3L) return(NA_real_)
+    y_bar <- mean(y)
+    group_means <- tapply(y, g, mean)
+    group_sizes <- as.numeric(table(g))
+    ss_between <- sum(group_sizes * (group_means - y_bar)^2)
+    ss_total <- sum((y - y_bar)^2)
+    if (ss_total <= 0) return(NA_real_)
+    as.numeric(ss_between / ss_total)
+  }
+  
+  # --- infer variable sets if not provided ---
+  if (is.null(cont) || is.null(cat)) {
+    cont_auto <- names(Filter(is.numeric, data))
+    cat_auto  <- names(Filter(is_categorical, data))
+    if (is.null(cont)) cont <- cont_auto
+    if (is.null(cat))  cat  <- cat_auto
+  }
+  
+  # Keep only, and ensure they exist
+  cont <- intersect(cont, names(data))
+  cat  <- intersect(cat,  names(data))
+  
+  # Drop constant variables (no variance) from cont
+  if (length(cont)) {
+    const_cont <- cont[vapply(cont, function(v) {
+      x <- data[[v]]; x <- x[!is.na(x)]
+      length(unique(x)) < 2L
+    }, logical(1))]
+    cont <- setdiff(cont, const_cont)
+  }
+  
+  # Drop single-level factors from cat
+  if (length(cat)) {
+    single_cat <- cat[vapply(cat, function(v) {
+      x <- as.factor(data[[v]]); x <- x[!is.na(x)]
+      length(levels(droplevels(x))) < 2L
+    }, logical(1))]
+    cat <- setdiff(cat, single_cat)
+  }
+  
+  # --- compute matrices ---
+  cor_mat <- NULL
+  if (length(cont) >= 2L) {
+    cor_mat <- suppressWarnings(cor(data[cont], use = use, method = method_num))
+  }
+  
+  cramers_mat <- NULL
+  if (length(cat) >= 2L) {
+    cramers_mat <- matrix(NA_real_, nrow = length(cat), ncol = length(cat),
+                          dimnames = list(cat, cat))
+    for (i in seq_along(cat)) {
+      for (j in seq_along(cat)) {
+        if (j <= i) next
+        v <- cramers_v(data[[cat[i]]], data[[cat[j]]])
+        cramers_mat[i, j] <- cramers_mat[j, i] <- v
+      }
+    }
+    diag(cramers_mat) <- 1
+  }
+  
+  eta_mat <- NULL
+  if (length(cat) >= 1L && length(cont) >= 1L) {
+    eta_mat <- matrix(NA_real_, nrow = length(cat), ncol = length(cont),
+                      dimnames = list(cat, cont))
+    for (i in seq_along(cat)) {
+      for (j in seq_along(cont)) {
+        eta_mat[i, j] <- eta_sq(data[[cont[j]]], data[[cat[i]]])
+      }
+    }
+  }
+  
+  # --- flag high associations ---
+  flagged <- list()
+  
+  # numeric–numeric
+  if (!is.null(cor_mat)) {
+    cm <- as.data.frame(as.table(cor_mat), responseName = "stat")
+    cm <- subset(cm, Var1 < Var2)  # upper triangle only
+    if (nrow(cm) > 0) {
+      cm$type <- "num-num(|r|)"
+      cm$stat <- abs(cm$stat)
+      cm <- subset(cm, !is.na(stat) & stat >= cutoff_num)
+      if (nrow(cm) > 0) flagged[[length(flagged)+1]] <- cm
+    }
+  }
+  
+  # categorical–categorical
+  if (!is.null(cramers_mat)) {
+    cv <- as.data.frame(as.table(cramers_mat), responseName = "stat")
+    cv <- subset(cv, Var1 < Var2)
+    if (nrow(cv) > 0) {
+      cv$type <- "cat-cat(CramersV)"
+      cv <- subset(cv, !is.na(stat) & stat >= cutoff_cat)
+      if (nrow(cv) > 0) flagged[[length(flagged)+1]] <- cv
+    }
+  }
+  
+  # categorical–numeric (eta^2)
+  if (!is.null(eta_mat)) {
+    em <- as.data.frame(as.table(eta_mat), responseName = "stat")
+    if (nrow(em) > 0) {
+      names(em) <- c("Var1","Var2","stat")  # Var1=cat, Var2=num
+      em$type <- "cat-num(eta^2)"
+      em <- subset(em, !is.na(stat) & stat >= cutoff_mixed)
+      if (nrow(em) > 0) flagged[[length(flagged)+1]] <- em
+    }
+  }
+  
+  flagged_df <- if (length(flagged)) {
+    do.call(rbind, flagged)
+  } else {
+    data.frame(Var1 = character(), Var2 = character(),
+               stat = numeric(), type = character())
+  }
+  
+  # Sort by magnitude
+  if (nrow(flagged_df)) {
+    flagged_df <- flagged_df[order(-flagged_df$stat), ]
+    rownames(flagged_df) <- NULL
+  }
+  
+  out <- list(
+    inputs = list(cont = cont, cat = cat,
+                  cutoff_num = cutoff_num, cutoff_cat = cutoff_cat,
+                  cutoff_mixed = cutoff_mixed, method_num = method_num),
+    cor_numeric = cor_mat,            # matrix or NULL
+    cramers_v = cramers_mat,          # matrix or NULL
+    eta2 = eta_mat,                   # matrix or NULL
+    flagged = flagged_df              # tidy data.frame of pairs passing thresholds
+  )
+  class(out) <- c("mlc_screen", class(out))
+  out
+}
